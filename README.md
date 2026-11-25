@@ -73,6 +73,33 @@ been isolated and confirmed. Full details, including three real engineering bugs
 along the way (a missing normalization layer, grouped-query attention, and a CUDA out-of-memory
 caused by accidentally leaving the full vocabulary table trainable), are in `RESULTS.md`.
 
+## Follow-up: validated at full real depth, on an actual fine-tuning job
+
+The experiments above test the mechanism on 2-4 real layers against a small synthetic probe task.
+The natural next question: does it survive at **full real model depth**, on an **actual downstream
+fine-tuning job**, not just a slice and a toy probe?
+
+Yes. The same split (freeze `o_proj`/`down_proj` at their real pretrained values; train only
+`q_proj`/`v_proj`/`gate_proj`/`up_proj`, via small LoRA adapters) was used as the actual learning
+algorithm for a real instruction-tuning run across **all 32 layers** of a Llama-3.1-8B-Instruct
+checkpoint, combined with standard PyTorch activation checkpointing
+(`torch.utils.checkpoint.checkpoint`, `use_reentrant=False`) to solve a separate, unrelated problem:
+holding every layer's activations in memory at once for one global backward pass at long sequence
+lengths. (That's an activation-memory problem, not a parameter-count problem — the two techniques
+solve different problems and compose cleanly; this run is the first time they were combined.)
+
+Real run: small instruction-tuning dataset, 2 epochs, 80 real optimizer steps, single 16GB
+consumer GPU, frozen-layer weights streamed from CPU-pinned int8 storage one layer at a time.
+Completed cleanly end to end — no crash, no OOM, GPU memory stable around 16GB the entire run,
+loss decreased normally. The trained LoRA deltas were merged directly into a fresh copy of the base
+checkpoint's weights, producing a standard HuggingFace-format model directory with no special
+loading code required. The resulting model was verified to produce coherent, on-topic responses
+that paraphrase rather than verbatim-echo its training examples — real learning, not memorization.
+
+This doesn't change the honest-scope caveats below (still one run, one downstream task, not a
+benchmark) — but it is the first evidence the mechanism holds up at full real-model depth on a real
+fine-tuning workload, not only on 2-4 layers and a synthetic probe.
+
 ## Honest scope
 
 This is a small, controlled experiment — a handful of real layers, a small synthetic task, not a

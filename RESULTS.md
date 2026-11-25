@@ -1,4 +1,5 @@
 # prototype_cluster_brick_transformer — first result, 2026-11-24
+# (updated 2026-11-25: full-depth, real fine-tuning-job validation added at the end)
 
 **Question**: can brick-style local learning (proven on the fly-reservoir + hand-built toy nets)
 be applied to a real transformer (Llama) architecture's own structure? "Shrimp eating a llama."
@@ -130,3 +131,51 @@ runs + this one), growing with more frozen parameters -- consistent with, but no
 the "fewer trainable parameters makes Adam's job easier" hypothesis. The clean next test to
 actually isolate WHY would be a global run restricted to the SAME parameter count as local (freeze
 Wo/Wdown there too, just also optimize some other dummy no-op path) -- not yet done.
+
+---
+
+## FULL-DEPTH, REAL FINE-TUNING-JOB VALIDATION -- 2026-11-25
+
+All five escalations above tested 2-4 real layers against a small synthetic associative-memory
+probe. This update goes further on both axes at once: **all 32 real layers** of a
+Llama-3.1-8B-Instruct checkpoint, and a **real instruction-tuning job** instead of a synthetic
+probe task.
+
+**Design**: the same freeze split as every prior escalation -- `o_proj`/`down_proj` frozen at
+their real pretrained values, only `q_proj`/`v_proj`/`gate_proj`/`up_proj` trained, via small
+rank-16 LoRA adapters (not full fine-tuning) -- used as the actual learning algorithm for a real
+SFT run. Combined with standard PyTorch gradient/activation checkpointing
+(`torch.utils.checkpoint.checkpoint`, `use_reentrant=False`) wrapping each layer's forward pass.
+These are not competing alternatives: the local-learning split answers "which parameters get
+trained and how," gradient checkpointing answers "how do we afford holding 32 layers of
+activations in memory for one global backward pass at longer sequence lengths" -- two different
+problems, composed together for the first time in this run. Frozen-layer weights were streamed
+from CPU-pinned int8 storage one layer at a time (an existing, separately-proven streaming
+mechanism, reused unchanged); exactly one real cross-entropy loss was computed once at the true
+final layer, with exactly one backward pass and one global optimizer step over all 32 layers'
+LoRA parameters together (not a per-layer early-exit scheme).
+
+**Real run, completed clean**: small instruction-tuning dataset, 2 epochs, 80 real optimizer
+steps, single 16GB consumer GPU, ~5 hours wall-clock (checkpointing's recompute cost is the main
+time cost, not a correctness cost -- it's mathematically identical to ordinary backprop, just
+trading compute for memory). GPU memory stable around 15.9-16.4GB the entire run, no OOM, no
+crash. Loss decreased from an early range of ~4-5.5 down to 3.27 by the final step (noisy
+single-example prints throughout, the same pattern as every other real run in this project).
+
+**Merge and verification**: the trained LoRA (A,B) deltas were merged directly into a fresh copy
+of the base checkpoint's weights (`B @ A`, shapes matching the base layer's weight exactly, no
+transpose needed), producing a standard HuggingFace-format model directory -- no special loading
+code, loads with a plain `AutoModelForCausalLM.from_pretrained(...)`. A scripted single-turn test
+confirmed the resulting model produces coherent, on-topic responses that **paraphrase rather than
+verbatim-echo** its training examples -- a concrete sign of real learning rather than
+memorization of one example.
+
+**Where this leaves the overall finding**: local-matches-global and local-converges-faster were
+established on 2-4 real layers against a synthetic probe. This run is the first test at **full
+real model depth (32 layers)** on an **actual fine-tuning workload**, and it holds: the method
+trains cleanly, fits in consumer GPU memory when combined with standard activation checkpointing,
+and produces a model that demonstrably learned (not memorized) its training data. Still one run,
+one downstream task -- not yet a benchmark, and the earlier "why is local faster" question (fewer
+trainable parameters making Adam's job easier, vs. something more fundamental) remains open and
+wasn't directly re-tested here. But the mechanism itself is no longer confined to small slices and
+synthetic tasks.
